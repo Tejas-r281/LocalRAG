@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\Rag.Application\Rag.Application.csproj" />
+		<ProjectReference Include="..\Rag.Domain\Rag.Domain.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.0" />
+	  <PackageReference Include="PdfPig" Version="0.1.16" />
+	  <PackageReference Include="PDFtoImage" Version="5.4.0" />
+	</ItemGroup>
+
+</Project>
