@@ -147,10 +147,9 @@ The following capabilities have been implemented and exercised during
 development:
 
 -   Clean Architecture solution with four projects.
--   Sentence-based text chunking with overlap.
+-   Paragraph-aware, sentence-aware character-based chunking with configurable overlap (default target: 1,200 characters; overlap: 200 characters).
 -   Local embeddings through Ollama using `nomic-embed-text`.
--   Qdrant collection creation/use, upsert, similarity search, and
-    document-filtered retrieval.
+-   Qdrant collection creation/use, upsert, similarity search, and metadata-filtered retrieval by document ID and page number.
 -   Local chat generation through Ollama using `qwen2.5:7b`.
 -   RAG question answering with retrieved source chunks returned
     alongside the answer.
@@ -166,6 +165,8 @@ development:
     corresponding SQLite metadata.
 -   Optional document-specific question answering using a document ID
     filter.
+-   Optional page-level retrieval filtering, including page-only searches
+    and combined document ID + page number filters.
 -   Postman-based endpoint testing.
 
 A successful scanned-PDF upload was verified in Postman with HTTP
@@ -752,32 +753,23 @@ restricted or removed before production.
 ## Chunking strategy
 
 `TextChunkingService` splits extracted text into smaller overlapping
-chunks.
+chunks. The current implementation is paragraph-aware and sentence-aware,
+with character-based chunk sizing.
 
-The current implementation is sentence-based and uses a simple
-sentence-splitting approach. The initial default configuration discussed
-and tested was:
+Current defaults:
 
--   Two sentences per chunk.
--   One sentence overlap.
+-   Target chunk size: `1200` characters.
+-   Overlap: `200` characters.
+-   Paragraphs are split first, then sentences are grouped into chunks.
+-   An unusually long sentence is split at word boundaries.
+-   Consecutive chunks reuse a trailing portion of the previous chunk to
+    preserve some context.
 
-The overlap preserves some context between neighbouring chunks.
+The values can be overridden through the `CreateChunks` method parameters:
+`targetChunkCharacters` and `overlapCharacters`.
 
-Example:
-
-``` text
-Original text:
-Sentence 1. Sentence 2. Sentence 3. Sentence 4.
-
-Chunk 1:
-Sentence 1. Sentence 2.
-
-Chunk 2:
-Sentence 2. Sentence 3.
-
-Chunk 3:
-Sentence 3. Sentence 4.
-```
+The chunk size is a character target, not a token limit. Actual chunk
+lengths can vary because sentence units are kept together where possible.
 
 Each chunk has metadata such as:
 
@@ -785,26 +777,23 @@ Each chunk has metadata such as:
 -   Chunk ID.
 -   Chunk index.
 -   Page number.
--   Start sentence index.
--   End sentence index.
+-   Start unit index.
+-   End unit index.
+
+**Metadata note:** The existing entity property names
+`StartSentenceIndex` and `EndSentenceIndex` are retained for compatibility,
+but with the current paragraph/sentence-unit chunker they represent
+indexes into the generated text units; they should not be treated as
+verified original sentence positions.
 -   Content.
 
 ### Current chunking limitations
 
-The current regex-based sentence splitting is a learning-stage
-implementation. It may not correctly handle:
-
--   Abbreviations.
--   Decimal values.
--   Bulleted lists.
--   Tables.
--   OCR line breaks.
--   Mixed Hindi and English punctuation.
--   Very long sentences.
--   Token limits of the chat model.
-
-A later phase will replace or improve this with paragraph-aware and
-token-aware chunking.
+The current regex-based sentence splitting is still a learning-stage
+implementation. It may not correctly handle abbreviations, decimal values,
+bulleted lists, tables, OCR line breaks, and mixed Hindi/English
+punctuation. The current implementation uses character-based sizing;
+token-aware chunking remains future work.
 
 ------------------------------------------------------------------------
 
@@ -888,9 +877,29 @@ application:
 -   Upsert a document chunk and embedding.
 -   Search using a query embedding.
 -   Optionally filter search by document ID.
+-   Optionally filter search by page number.
+-   Combine document ID and page number conditions in one filter.
 -   Delete all points belonging to a particular document ID.
 
 Document-specific filtering uses the payload field `documentId`.
+Page-level filtering uses the integer payload field `pageNumber`.
+
+The current `SearchAsync` contract accepts optional `documentId` and
+`pageNumber` parameters. When both are supplied, Qdrant applies both
+conditions using its `must` filter, so a point must match both values.
+When neither is supplied, retrieval remains global.
+
+Supported filter combinations:
+
+| `documentId` | `pageNumber` | Retrieval scope |
+|---|---|---|
+| Omitted | Omitted | All indexed documents |
+| Supplied | Omitted | One document |
+| Omitted | Supplied | That page number across documents |
+| Supplied | Supplied | That page in that document |
+
+Page numbers are one-based PDF page numbers, matching the metadata stored
+during ingestion.
 
 ### Inspect Qdrant points
 
@@ -1015,10 +1024,10 @@ The question answering service coordinates retrieval and generation.
 
 Current flow:
 
-1.  Receive a question and optional document ID.
+1.  Receive a question and optional `documentId` and `pageNumber` filters.
 2.  Generate an embedding for the question using `nomic-embed-text`.
 3.  Search Qdrant for similar chunks.
-4.  If a document ID is supplied, filter retrieval to that document.
+4.  Apply the supplied metadata filters: document ID, page number, or both.
 5.  Build a prompt containing retrieved chunks and source metadata.
 6.  Send the prompt to the local chat model `qwen2.5:7b`.
 7.  Return the answer and retrieved source chunks.
@@ -1035,12 +1044,19 @@ public class RagQuestionRequest
 {
     public string Question { get; set; } = string.Empty;
     public Guid? DocumentId { get; set; }
+    public int? PageNumber { get; set; }
 }
 ```
 
-If `DocumentId` is omitted, the search can use all indexed documents. If
-a document ID is supplied, the Qdrant search is filtered to that
-document.
+Both metadata filters are optional:
+
+-   If both are omitted, search all indexed documents.
+-   If only `DocumentId` is supplied, search within that document.
+-   If only `PageNumber` is supplied, search that page number across all
+    indexed documents.
+-     If both are supplied, search that page in the specified document.
+
+`PageNumber` must be a positive, one-based page number.
 
 The response model includes the generated answer and retrieved source
 chunks. The current source metadata includes document/chunk information
@@ -1165,6 +1181,25 @@ Example request for one document:
 {
   "question": "Summarise the key information in this document.",
   "documentId": "YOUR-DOCUMENT-GUID"
+}
+```
+
+Example request for page 3 across all documents:
+
+``` json
+{
+  "question": "What information is available on this page?",
+  "pageNumber": 3
+}
+```
+
+Example request for page 3 of one document:
+
+``` json
+{
+  "question": "What information is available on this page?",
+  "documentId": "YOUR-DOCUMENT-GUID",
+  "pageNumber": 3
 }
 ```
 
@@ -1315,7 +1350,9 @@ Recommended end-to-end test sequence:
 5.  Inspect its Qdrant points and payload content.
 6.  Ask a question across all documents.
 7.  Ask a question filtered to a specific document.
-8.  Upload a scanned PDF.
+8.  Ask a question filtered by page number across documents.
+9.  Ask a question filtered by both document ID and page number.
+10. Upload a scanned PDF.
 9.  Confirm that the scanned PDF is processed with a non-zero chunk
     count.
 10. Inspect the extracted OCR chunks in Qdrant.
@@ -1445,14 +1482,18 @@ not yet production-hardened.
 4.  **OCR confidence:** OCR confidence scores are not stored.
 5.  **Table extraction:** text may be recognised, but row/column
     relationships are not reliably reconstructed.
-6.  **Chunking:** sentence-based regex splitting is basic and can
-    mishandle abbreviations, lists, tables, decimals, and OCR line
-    breaks.
-7.  **Chunk sizing:** token-aware chunk limits have not yet been
+6.  **Chunking:** paragraph-aware and sentence-aware character-based
+    chunking is implemented, but regex splitting can still mishandle
+    abbreviations, lists, tables, decimals, and OCR line breaks.
+7.  **Chunk sizing:** the current 1,200-character target and 200-character
+    overlap are not token-aware; token-based limits have not yet been
     implemented.
-8.  **Retrieval:** current retrieval is vector similarity search; hybrid
+9.  **Chunk index metadata:** the legacy `StartSentenceIndex` and
+    `EndSentenceIndex` property names do not precisely describe the
+    generated text-unit indexes used by the current chunker.
+9.  **Retrieval:** current retrieval is vector similarity search; hybrid
     keyword/vector retrieval is planned.
-9.  **Reranking:** retrieved chunks are not yet reranked.
+10.  **Reranking:** retrieved chunks are not yet reranked.
 10. **Query rewriting:** query expansion or rewriting is not yet
     implemented.
 11. **Context compression:** retrieved context is not yet compressed.
@@ -1481,7 +1522,6 @@ not yet production-hardened.
     coverage needs to be added.
 
 ------------------------------------------------------------------------
-
 ## Development roadmap
 
 The following is the planned project roadmap. It distinguishes
@@ -1515,13 +1555,14 @@ implemented work from future work.
 **Implemented / available**
 
 5.  Document-specific question answering.
-6.  Metadata filtering by document ID.
+6.  Improved paragraph-aware, sentence-aware character-based chunking.
+7.  Metadata filtering by document ID and page number, including combined
+    filters.
 
 **Planned**
 
-6.  Improve chunking strategy.
-7.  Improve source citations.
-8.  Handle questions when no relevant context exists.
+8.  Improve source citations.
+9.  Handle questions when no relevant context exists.
 
 ### Phase 4 --- Advanced Retrieval
 
@@ -1610,6 +1651,8 @@ management and hybrid scanned-PDF OCR.
 -   Retrieve relevant chunks.
 -   Generate an answer with the local chat model.
 -   Filter retrieval to a selected document.
+-   Filter retrieval by page number, either across documents or within a
+    selected document.
 
 The next planned work is to complete the remaining RAG improvements,
 advanced retrieval, document intelligence, React frontend, and
